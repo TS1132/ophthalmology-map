@@ -349,6 +349,9 @@ function toggleLegend(){
 
 
 
+
+
+
 <script>
 (function(){
   let addressSearchMarker = null;
@@ -364,7 +367,7 @@ function toggleLegend(){
     return String(q || '')
       .trim()
       .replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0)-0xFEE0))
-      .replace(/[－ー−―]/g, '-')
+      .replace(/[－ー−―‐]/g, '-')
       .replace(/\s+/g, '')
       .replace(/丁目/g, '-')
       .replace(/番地/g, '-')
@@ -377,28 +380,34 @@ function toggleLegend(){
   function makeAddressQueries(q){
     const raw = String(q || '').trim();
     const norm = normalizeJapaneseAddress(raw);
+    const noPostal = norm.replace(/〒?\d{3}-?\d{4}/, '');
     const list = [];
-    [raw, norm, raw + ' 日本', norm + ' 日本'].forEach(v=>{
+
+    [raw, norm, noPostal].forEach(v=>{
       if(v && !list.includes(v)) list.push(v);
     });
-    // 番地までで失敗した場合に備えて末尾を少しずつ削る
-    const parts = norm.split('-');
-    if(parts.length >= 3){
-      list.push(parts.slice(0,2).join('-') + ' 日本');
-      list.push(parts.slice(0,1).join('-') + ' 日本');
+
+    // 番地入りで失敗するケース用：末尾番地を落とす候補も作る
+    const parts = noPostal.split('-');
+    for(let i=parts.length; i>=1; i--){
+      const s = parts.slice(0,i).join('-');
+      if(s && !list.includes(s)) list.push(s);
     }
+
     return list.filter(Boolean);
   }
 
   function formatJapaneseAddress(displayName, original){
     const src = String(displayName || original || '');
-    const parts = src.split(',').map(s=>s.trim()).filter(Boolean);
-    const postal = parts.find(p => /^\d{3}-?\d{4}$/.test(p));
-    const jp = parts.filter(p => p !== '日本' && p !== 'Japan' && !/^\d{3}-?\d{4}$/.test(p));
-    const rev = jp.reverse();
-    let out = rev.join('');
-    if(postal) out += '（〒' + postal + '）';
-    return out || String(original || '');
+    if(src.includes(',')){
+      const parts = src.split(',').map(s=>s.trim()).filter(Boolean);
+      const postal = parts.find(p => /^\d{3}-?\d{4}$/.test(p));
+      const jp = parts.filter(p => p !== '日本' && p !== 'Japan' && !/^\d{3}-?\d{4}$/.test(p));
+      let out = jp.reverse().join('');
+      if(postal) out += '（〒' + postal + '）';
+      return out || String(original || '');
+    }
+    return src || String(original || '');
   }
 
   function clearAddressSearch(){
@@ -432,6 +441,7 @@ function toggleLegend(){
       {m:2000, label:'2km', color:'#111827', dash:null},
       {m:3000, label:'3km', color:'#111827', dash:null}
     ];
+
     defs.forEach(d=>{
       const circle = L.circle([lat,lon], {
         radius:d.m,
@@ -471,33 +481,63 @@ function toggleLegend(){
     addressSearchMarker = L.marker([lat, lon], {icon:icon}).addTo(map);
     addRadius(lat, lon);
 
-    const cleanLabel = formatJapaneseAddress(label, document.getElementById('q')?.value || '');
+    const input = document.getElementById('q')?.value || '';
+    const cleanLabel = formatJapaneseAddress(label, input);
     addressSearchMarker.bindPopup('<b>住所検索地点</b><br>'+cleanLabel).openPopup();
 
     addressSearchMarker.on('click', function(){
       clearAddressSearch();
     });
 
-    map.setView([lat, lon], 15);
+    map.setView([lat, lon], 16);
   }
 
-  async function geocodeAddress(q){
+  async function geocodeGSI(q){
     const queries = makeAddressQueries(q);
     for(const query of queries){
-      const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=jp&accept-language=ja&q=' + encodeURIComponent(query);
       try{
+        const url = 'https://msearch.gsi.go.jp/address-search/AddressSearch?q=' + encodeURIComponent(query);
+        const res = await fetch(url, {headers:{'Accept':'application/json'}});
+        if(!res.ok) continue;
+        const arr = await res.json();
+        if(arr && arr.length && arr[0].geometry && arr[0].geometry.coordinates){
+          const lon = arr[0].geometry.coordinates[0];
+          const lat = arr[0].geometry.coordinates[1];
+          const title = arr[0].properties && arr[0].properties.title ? arr[0].properties.title : query;
+          addAddressMarker(lat, lon, title);
+          return true;
+        }
+      }catch(e){
+        console.warn('GSI geocode failed:', query, e);
+      }
+    }
+    return false;
+  }
+
+  async function geocodeNominatim(q){
+    const queries = makeAddressQueries(q);
+    for(const query of queries){
+      try{
+        const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=jp&accept-language=ja&q=' + encodeURIComponent(query + ' 日本');
         const res = await fetch(url, {headers:{'Accept':'application/json'}});
         if(!res.ok) continue;
         const arr = await res.json();
         if(arr && arr.length){
           const hit = arr[0];
-          addAddressMarker(parseFloat(hit.lat), parseFloat(hit.lon), hit.display_name || q);
+          addAddressMarker(parseFloat(hit.lat), parseFloat(hit.lon), hit.display_name || query);
           return true;
         }
       }catch(e){
-        console.warn('geocode retry failed', query, e);
+        console.warn('Nominatim geocode failed:', query, e);
       }
     }
+    return false;
+  }
+
+  async function geocodeAddress(q){
+    // 日本住所は国土地理院を優先。ダメならNominatim。
+    if(await geocodeGSI(q)) return true;
+    if(await geocodeNominatim(q)) return true;
     return false;
   }
 
@@ -513,7 +553,7 @@ function toggleLegend(){
     if(isProbablyAddress(q)){
       const ok = await geocodeAddress(q);
       if(!ok){
-        alert('住所検索に失敗しました。例：千葉県柏市十余二249-49 のように入力してください。');
+        alert('住所検索に失敗しました。番地を少し省略して「千葉県柏市十余二」などで試してください。');
       }
     }
   };
